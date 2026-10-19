@@ -6,10 +6,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        nim-version: ['stable']
-        include:
-          - nim-version: '2.0.x'
-            atomic_arc: true
+        nim-version: ['2.2.12']
 
     runs-on: ${{ matrix.os }}
 
