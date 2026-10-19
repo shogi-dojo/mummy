@@ -112,6 +112,9 @@ def exercise(port, context, cert)
   sender = Thread.new { payloads.each { |data| slow.write(frame(data)) } }
   sleep 0.2
   http(port, cert) { |client| check(client.get('/healthz').body == 'ok') }
+  # Reopen the receive window before draining: Linux's tiny-window delayed ACKs can make
+  # the deliberate stall dominate the test for minutes, including on the plain baseline.
+  (context ? slow.to_io : slow).setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVBUF, 512 * 1024)
   payloads.each { |data| check(receive(slow) == [2, data], 'corrupt or reordered backpressured frame') }
   sender.value
   slow.close
@@ -133,14 +136,37 @@ Dir.mktmpdir('mummy-tls-') do |directory|
   cert, key = %w[cert.pem key.pem].map { |file| File.join(directory, file) }
   check(system('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
                '-out', cert, '-days', '1', '-subj', '/CN=localhost', '-addext',
-               'subjectAltName=DNS:localhost,IP:127.0.0.1', out: File::NULL, err: File::NULL))
+               'subjectAltName=DNS:localhost,IP:127.0.0.1', '-addext', 'basicConstraints=critical,CA:TRUE',
+               '-addext', 'keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign,cRLSign',
+               out: File::NULL, err: File::NULL))
   context = OpenSSL::SSL::SSLContext.new
   context.ca_file = cert
   context.verify_mode = OpenSSL::SSL::VERIFY_PEER
-  [false, true].each do |secure|
+  # An ECDSA leaf signed by the temporary RSA CA exercises complete PEM chain loading.
+  leaf_key = OpenSSL::PKey::EC.generate('prime256v1')
+  root = OpenSSL::X509::Certificate.new(File.read(cert))
+  leaf = OpenSSL::X509::Certificate.new
+  leaf.version, leaf.serial = 2, 2
+  leaf.subject = OpenSSL::X509::Name.parse('/CN=localhost')
+  leaf.issuer = root.subject
+  leaf.public_key = leaf_key
+  leaf.not_before, leaf.not_after = Time.now - 60, Time.now + 86_400
+  extensions = OpenSSL::X509::ExtensionFactory.new
+  extensions.subject_certificate, extensions.issuer_certificate = leaf, root
+  leaf.extensions = [extensions.create_extension('basicConstraints', 'CA:FALSE', true),
+                     extensions.create_extension('keyUsage', 'digitalSignature', true),
+                     extensions.create_extension('extendedKeyUsage', 'serverAuth'),
+                     extensions.create_extension('subjectAltName', 'DNS:localhost,IP:127.0.0.1')]
+  leaf.sign(OpenSSL::PKey.read(File.read(key)), OpenSSL::Digest::SHA256.new)
+  chain, ec_key = File.join(directory, 'chain.pem'), File.join(directory, 'ec-key.pem')
+  File.write(chain, leaf.to_pem + root.to_pem)
+  File.write(ec_key, leaf_key.to_pem)
+  [:plain, :tls, :chain].each do |mode|
+    secure = mode != :plain
     port = free_port
     log = Tempfile.new('mummy-output')
-    pid = Process.spawn(binary, port.to_s, *(secure ? [cert, key] : []), out: log, err: log)
+    credentials = mode == :chain ? [chain, ec_key] : [cert, key]
+    pid = Process.spawn(binary, port.to_s, *(secure ? credentials : []), out: log, err: log)
     begin
       Timeout.timeout(10) do
         loop do
@@ -194,7 +220,7 @@ Dir.mktmpdir('mummy-tls-') do |directory|
       _, status = Timeout.timeout(10) { Process.wait2(pid) }
       pid = nil
       check(status.success?, 'fixture failed during shutdown')
-      puts "PASS #{secure ? 'HTTPS/WSS' : 'HTTP/WS'}"
+      puts "PASS #{mode == :chain ? 'HTTPS/WSS ECDSA certificate chain' : (secure ? 'HTTPS/WSS' : 'HTTP/WS')}"
     ensure
       if pid
         Process.kill('KILL', pid) rescue nil
