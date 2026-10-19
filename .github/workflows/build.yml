@@ -1,15 +1,15 @@
 name: Github Actions
-on: [push, pull_request]
+on:
+  push:
+    branches: [dojo]
+  pull_request:
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        nim-version: ['stable']
-        include:
-          - nim-version: '2.0.x'
-            atomic_arc: true
+        nim-version: ['2.2.12']
 
     runs-on: ${{ matrix.os }}
 
@@ -29,3 +29,6 @@ jobs:
     - run: nim c -r -d:useMalloc tests/test_http2.nim
     - run: nim c -r -d:useMalloc tests/test_websockets.nim
     - run: nim c -r -d:useMalloc -d:mummyNoWorkers tests/fuzz_recv.nim
+      if: runner.os != 'Windows'
+    - run: nim c -r -d:useMalloc -d:mummyNoWorkers -d:fuzzIterations=100 tests/fuzz_recv.nim
+      if: runner.os == 'Windows'

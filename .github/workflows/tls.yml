@@ -1,0 +1,47 @@
+name: TLS and plain transports
+on:
+  push:
+    branches: [dojo]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  transports:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.12'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0.7'
+      - run: nimble install -y --depsOnly
+      - run: nimble install -y jsony@1.1.6
+      - name: OpenSSL runtime on macOS
+        if: runner.os == 'macOS'
+        run: echo "DYLD_LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+      - name: Plain build and unit tests
+        run: |
+          nim c -r --threads:on --mm:orc tests/test.nim
+          nim c -r --threads:on --mm:orc tests/test_batching.nim
+          nim c -r --threads:on --mm:orc tests/test_tls_state.nim
+          nim c -r --threads:on --mm:orc tests/test_http.nim
+          nim c -r --threads:on --mm:orc tests/test_http2.nim
+      - name: TLS unit tests
+        run: |
+          nim c --threads:on --mm:orc -d:ssl -d:sslVersion=3 tests/test_batching.nim
+          nim c --threads:on --mm:orc -d:ssl -d:sslVersion=3 tests/test_tls_state.nim
+          nim c --threads:on --mm:orc -d:ssl -d:sslVersion=3 -d:mummyTlsTest tests/test_tls_retry.nim
+          ./tests/test_batching
+          ./tests/test_tls_state
+          ./tests/test_tls_retry
+      - name: TLS and plain wire tests
+        run: |
+          nim c -d:release --threads:on --mm:orc -d:ssl -d:sslVersion=3 -o:tests/tls_server tests/tls_server.nim
+          ruby tests/test_tls.rb tests/tls_server
