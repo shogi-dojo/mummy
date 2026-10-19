@@ -1,5 +1,8 @@
 # Mummy
 
+This public Dojo fork adds optional native HTTPS/WSS through OpenSSL 3 and safe WebSocket
+write batching. See [TLS configuration, build flags and tests](TLS.md). Version: **0.5.0**.
+
 `nimble install mummy`
 
 ![Github Actions](https://github.com/guzba/mummy/workflows/Github%20Actions/badge.svg)

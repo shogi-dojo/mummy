@@ -19,6 +19,7 @@ jobs:
         with:
           ruby-version: '4.0.7'
       - run: nimble install -y --depsOnly
+      - run: nimble install -y jsony@1.1.6
       - name: OpenSSL runtime on macOS
         if: runner.os == 'macOS'
         run: echo "DYLD_LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
