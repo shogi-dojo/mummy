@@ -8,6 +8,9 @@ block:
   doAssert queue.len == 1
   doAssert first.buffer1 == "firstsecond"
   doAssert first.bytesSent == 2
+  first.tlsFrozen = true
+  doAssert not joinFrame(queue, OutgoingBuffer(buffer1: "retry must stay identical"))
+  first.tlsFrozen = false
   for boundary in [OutgoingBuffer(isCloseFrame: true),
                    OutgoingBuffer(closeConnection: true),
                    OutgoingBuffer(buffer2: "large")]:

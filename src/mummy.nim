@@ -9,7 +9,7 @@ import mummy/common, mummy/internal, std/atomics, std/base64,
     std/cpuinfo, std/deques, std/hashes, std/nativesockets, std/os,
     std/parseutils, std/random, std/selectors, std/sets, crunchy,
     std/tables, std/times, webby/httpheaders, webby/queryparams, webby/urls,
-    zippy, std/options
+    zippy, std/options, std/monotimes, std/heapqueue, mummy/tls
 
 from std/strutils import find, cmpIgnoreCase, toLowerAscii
 
@@ -30,7 +30,7 @@ elif defined(posix):
 
 import std/locks
 
-export Port, common, httpheaders, queryparams
+export Port, common, httpheaders, queryparams, TlsConfig
 
 const
   whitespace = {' ', '\t'}
@@ -89,8 +89,15 @@ type
     logHandler: LogHandler
     maxHeadersLen, maxBodyLen, maxMessageLen: int
     tcpNoDelay: bool
+    tlsContext: TlsContext
+    tlsHandshakeTimeout, tlsShutdownTimeout, tlsHandshakeLimit: int
+    pendingHandshakes: int
+    tlsDeadlines: Table[SocketHandle, tuple[id: uint64, at: int64]]
+    tlsTimers: HeapQueue[tuple[at: int64, fd: int, id: uint64]]
+    tlsReady: HashSet[SocketHandle]
     rand: Rand
     workerThreads: seq[Thread[Server]]
+    workersStarted: int
     serving: Atomic[bool]
     destroyCalled: bool
     socket: SocketHandle
@@ -124,6 +131,7 @@ type
     of EventEntry:
       event: SelectEvent
     of ClientSocketEntry:
+      tls: TlsConnection
       clientId: uint64
       remoteAddress: string
       recvBuf: string
@@ -155,6 +163,7 @@ type
     frameLen: int
 
   OutgoingBuffer {.acyclic.} = ref object
+    tlsFrozen: bool # SSL_write retries must use identical storage and length
     clientSocket: SocketHandle
     clientId: uint64
     closeConnection, isWebSocketUpgrade, isCloseFrame: bool
@@ -247,6 +256,33 @@ proc trigger(
       "Error triggering event ", $err, " ", osErrorMsg(err)
     )
 
+proc updateClient(server: Server, socket: SocketHandle, data: DataEntry) {.raises: [IOSelectorsException].} =
+  let interests = if data.tls.handle == nil: {Read, Write} else:
+    tlsInterests(data.tls, data.outgoingBuffers.len > 0)
+  server.selector.updateHandle2(socket, interests)
+
+proc tlsNow(): int64 {.raises: [].} = getMonoTime().ticks div 1_000_000
+
+proc trackTlsDeadline(server: Server, socket: SocketHandle, data: DataEntry, timeout: int) {.raises: [].} =
+  let at = tlsNow() + timeout
+  server.tlsDeadlines[socket] = (data.clientId, at)
+  server.tlsTimers.push((at, socket.int, data.clientId))
+
+proc tlsSelectTimeout(server: Server): int {.raises: [].} =
+  # Compact stale timers after bursts without scanning established connections.
+  if server.tlsTimers.len > server.tlsDeadlines.len * 2 + 256:
+    server.tlsTimers.clear()
+    for fd, deadline in server.tlsDeadlines:
+      server.tlsTimers.push((deadline.at, fd.int, deadline.id))
+  while server.tlsTimers.len > 0:
+    let first = server.tlsTimers[0]
+    let current = server.tlsDeadlines.getOrDefault(SocketHandle(first.fd))
+    if current != (first.id, first.at):
+      discard server.tlsTimers.pop()
+    else:
+      return int(max(0'i64, first.at - tlsNow()))
+  -1
+
 proc setNoDelay(
   server: Server,
   socket: SocketHandle
@@ -268,7 +304,7 @@ proc joinFrame(queue: var Deque[OutgoingBuffer], frame: OutgoingBuffer): bool {.
   if queue.len == 0 or frame.isCloseFrame or frame.closeConnection or frame.buffer2.len > 0:
     return false
   let last = queue.peekLast()
-  if last.isCloseFrame or last.closeConnection or last.isWebSocketUpgrade or
+  if last.tlsFrozen or last.isCloseFrame or last.closeConnection or last.isWebSocketUpgrade or
       last.buffer2.len > 0 or last.buffer1.len + frame.buffer1.len > MaxJoinedBufferBytes:
     return false
   last.buffer1.add frame.buffer1
@@ -604,7 +640,7 @@ proc sendCloseFrame(
   outgoingBuffer.closeConnection = closeConnection
   dataEntry.outgoingBuffers.addLast(outgoingBuffer)
   dataEntry.closeFrameQueuedAt = epochTime()
-  server.selector.updateHandle2(clientSocket, {Read, Write})
+  server.updateClient(clientSocket, dataEntry)
 
 proc afterRecvWebSocket(
   server: Server,
@@ -1124,12 +1160,87 @@ proc afterSend(
       return true
   # If we don't have any more outgoing buffers, update the selector
   if dataEntry.outgoingBuffers.len == 0:
-    server.selector.updateHandle2(clientSocket, {Read})
+    if dataEntry.tls.handle == nil:
+      server.selector.updateHandle2(clientSocket, {Read})
+    else:
+      server.updateClient(clientSocket, dataEntry)
+
+when defined(ssl):
+  proc serviceTls(server: Server, socket: SocketHandle, data: DataEntry,
+                  events: set[Event]): bool {.raises: [IOSelectorsException].} =
+    if data.tls.phase == tlsHandshake:
+      if not satisfied(data.tls.wait, events): return
+      let status = data.tls.handshakeTls()
+      if status in {tlsClosed, tlsFailed}: return true
+      if status != tlsReady:
+        server.updateClient(socket, data)
+        return
+      dec server.pendingHandshakes
+      server.tlsDeadlines.del(socket)
+    if data.tls.phase == tlsClosing:
+      if satisfied(data.tls.wait, events):
+        if data.tls.shutdownTls() in {tlsClosed, tlsFailed}: return true
+      server.updateClient(socket, data)
+      return
+
+    # Retry exclusive operations before starting any different TLS I/O.
+    let retryWrite = data.tls.writeWait in {tlsRead, tlsWrite}
+    let retryRead = data.tls.readWait == tlsWrite
+    if retryWrite and not satisfied(data.tls.writeWait, events): return
+    if retryRead and not retryWrite and Write notin events: return
+
+    template writeOutput() =
+      if data.outgoingBuffers.len > 0:
+        let output = data.outgoingBuffers.peekFirst()
+        output.tlsFrozen = true
+        let first = output.bytesSent < output.buffer1.len
+        let pos = if first: output.bytesSent else: output.bytesSent - output.buffer1.len
+        let buffer = if first: addr output.buffer1[pos] else: addr output.buffer2[pos]
+        let available = if first: output.buffer1.len - pos else: output.buffer2.len - pos
+        let count = data.tls.writeTls(buffer, min(32 * 1024, available))
+        if data.tls.writeWait in {tlsClosed, tlsFailed}: return true
+        if count > 0:
+          output.bytesSent += count
+          if server.afterSend(socket, data):
+            data.tls.phase = tlsClosing
+            data.tls.wait = tlsReady
+            server.trackTlsDeadline(socket, data, server.tlsShutdownTimeout)
+            if data.tls.shutdownTls() in {tlsClosed, tlsFailed}: return true
+
+    if retryWrite:
+      writeOutput()
+      if data.tls.writeWait != tlsReady:
+        server.updateClient(socket, data)
+        return
+
+    if data.tls.phase == tlsOpen and (Read in events or retryRead or data.tls.pendingTls()):
+      if data.bytesReceived == data.recvBuf.len:
+        data.recvBuf.setLen(data.recvBuf.len * 2)
+      let count = data.tls.readTls(addr data.recvBuf[data.bytesReceived],
+                                 min(32 * 1024, data.recvBuf.len - data.bytesReceived))
+      if data.tls.readWait in {tlsClosed, tlsFailed}: return true
+      if count > 0:
+        data.bytesReceived += count
+        if server.afterRecv(socket, data): return true
+
+    if data.tls.phase == tlsOpen and not retryWrite and data.tls.readWait != tlsWrite and
+        Write in events:
+      writeOutput()
+    if data.tls.phase == tlsOpen and data.tls.pendingTls() and
+        data.tls.writeWait != tlsWrite and data.tls.readWait != tlsWrite:
+      server.tlsReady.incl(socket)
+    server.updateClient(socket, data)
 
 proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
   withLock server.taskQueueLock:
     server.destroyCalled = true
   if server.selector != nil:
+    for clientSocket in server.clientSockets:
+      try:
+        let data = server.selector.getData(clientSocket)
+        data.tls.freeTls()
+      except Exception:
+        discard
     try:
       server.selector.close()
     except Exception as e:
@@ -1138,9 +1249,11 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     server.socket.close()
   for clientSocket in server.clientSockets:
     clientSocket.close()
+  server.tlsContext.freeTlsContext()
   broadcast(server.taskQueueCond)
   if joinThreads:
-    joinThreads(server.workerThreads)
+    for i in 0 ..< server.workersStarted:
+      joinThread(server.workerThreads[i])
     deinitLock(server.taskQueueLock)
     deinitCond(server.taskQueueCond)
     deinitLock(server.responseQueueLock)
@@ -1172,14 +1285,30 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     needClosing: HashSet[SocketHandle]
     encodedResponses: seq[OutgoingBuffer]
     encodedFrames: seq[OutgoingBuffer]
+  when defined(ssl):
+    var tlsServiced: HashSet[SocketHandle]
   while true:
     receivedFrom.setLen(0)
     sentTo.setLen(0)
     needClosing.clear()
     encodedResponses.setLen(0)
     encodedFrames.setLen(0)
+    when defined(ssl): tlsServiced.clear()
 
-    let readyCount = server.selector.selectInto(-1, readyKeys)
+    let timeout = server.tlsSelectTimeout()
+    let readyCount = server.selector.selectInto(if server.tlsReady.len > 0: 0 else: timeout, readyKeys)
+    when defined(ssl):
+      let buffered = move(server.tlsReady)
+      for socket in buffered:
+        if socket in server.selector:
+          let data = server.selector.getData(socket)
+          if server.serviceTls(socket, data, {}): needClosing.incl(socket)
+          tlsServiced.incl(socket)
+      while server.tlsTimers.len > 0 and server.tlsTimers[0].at <= tlsNow():
+        let timer = server.tlsTimers.pop()
+        let socket = SocketHandle(timer.fd)
+        if server.tlsDeadlines.getOrDefault(socket) == (timer.id, timer.at):
+          needClosing.incl(socket)
 
     # Collapse these events into simple flags
     var responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
@@ -1210,10 +1339,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             server.selector.getData(encodedResponse.clientSocket)
           if encodedResponse.clientId == clientDataEntry.clientId:
             clientDataEntry.outgoingBuffers.addLast(encodedResponse)
-            server.selector.updateHandle2(
-              encodedResponse.clientSocket,
-              {Read, Write}
-            )
+            server.updateClient(encodedResponse.clientSocket, clientDataEntry)
 
             clientDataEntry.requestCounter =
               max(clientDataEntry.requestCounter - 1, 0)
@@ -1266,10 +1392,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                 clientDataEntry.outgoingBuffers.addLast(encodedFrame)
                 if encodedFrame.isCloseFrame:
                   clientDataEntry.closeFrameQueuedAt = epochTime()
-                server.selector.updateHandle2(
-                  encodedFrame.clientSocket,
-                  {Read, Write}
-                )
+                server.updateClient(encodedFrame.clientSocket, clientDataEntry)
             else:
               # If we haven't, queue this to wait for the upgrade response
               clientDataEntry.sendsWaitingForUpgrade.add(encodedFrame)
@@ -1324,19 +1447,51 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           if server.tcpNoDelay:
             server.setNoDelay(clientSocket)
 
+          if server.tlsContext != nil and server.pendingHandshakes >= server.tlsHandshakeLimit:
+            clientSocket.close()
+            continue
+
           server.clientSockets.incl(clientSocket)
 
           let dataEntry = DataEntry(kind: ClientSocketEntry)
           dataEntry.clientId = server.rand.next()
           dataEntry.remoteAddress = remoteAddress
           dataEntry.recvBuf.setLen(initialRecvBufLen)
-          server.selector.registerHandle2(clientSocket, {Read}, dataEntry)
+          when defined(ssl):
+            if server.tlsContext != nil:
+              dataEntry.tls = initTls(server.tlsContext, clientSocket)
+              if dataEntry.tls.handle == nil:
+                clientSocket.close()
+                server.clientSockets.excl(clientSocket)
+                continue
+              inc server.pendingHandshakes
+              server.trackTlsDeadline(clientSocket, dataEntry, server.tlsHandshakeTimeout)
+          try:
+            server.selector.registerHandle2(clientSocket, {Read}, dataEntry)
+          except IOSelectorsException:
+            if dataEntry.tls.handle != nil:
+              dec server.pendingHandshakes
+              dataEntry.tls.freeTls()
+            server.tlsDeadlines.del(clientSocket)
+            server.clientSockets.excl(clientSocket)
+            clientSocket.close()
+            raise
       else: # Client socket
         if Error in readyKey.events:
           needClosing.incl(readyKey.fd.SocketHandle)
           continue
 
         let dataEntry = server.selector.getData(readyKey.fd)
+
+        if dataEntry.kind != ClientSocketEntry: continue
+
+        if readyKey.fd.SocketHandle in needClosing: continue
+        when defined(ssl):
+          if dataEntry.tls.handle != nil:
+            if readyKey.fd.SocketHandle in tlsServiced: continue
+            if server.serviceTls(readyKey.fd.SocketHandle, dataEntry, readyKey.events):
+              needClosing.incl(readyKey.fd.SocketHandle)
+            continue
 
         if Read in readyKey.events:
           # Expand the buffer if it is full
@@ -1400,6 +1555,11 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
 
     for clientSocket in needClosing:
       let dataEntry = server.selector.getData(clientSocket)
+      if dataEntry.tls.handle != nil and dataEntry.tls.phase == tlsHandshake:
+        dec server.pendingHandshakes
+      server.tlsDeadlines.del(clientSocket)
+      server.tlsReady.excl(clientSocket)
+      dataEntry.tls.freeTls()
       try:
         server.selector.unregister(clientSocket)
       except Exception as e:
@@ -1484,7 +1644,7 @@ proc serve*(
     server.loopForever()
   except Exception as e:
     server.log(ErrorLevel, e.msg & "\n" & e.getStackTrace())
-    server.destroy(false)
+    server.destroy(true)
     raise currentExceptionAsMummyError()
 
 proc newServer*(
@@ -1495,7 +1655,8 @@ proc newServer*(
   maxHeadersLen = 8 * 1024, # 8 KB
   maxBodyLen = 1024 * 1024, # 1 MB
   maxMessageLen = 64 * 1024, # 64 KB
-  tcpNoDelay = true
+  tcpNoDelay = true,
+  tls: TlsConfig = nil
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1506,6 +1667,9 @@ proc newServer*(
 
   if handler == nil:
     raise newException(MummyError, "The request handler must not be nil")
+
+  # Validate TLS before starting workers or creating selector resources.
+  let tlsContext = newTlsContext(tls)
 
   var workerThreads = workerThreads
   when defined(mummyNoWorkers): # For testing, fuzzing etc
@@ -1519,9 +1683,20 @@ proc newServer*(
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
   result.tcpNoDelay = tcpNoDelay
+  result.tlsContext = tlsContext
+  if tls != nil:
+    result.tlsHandshakeTimeout = tls.handshakeTimeoutMs
+    result.tlsShutdownTimeout = tls.shutdownTimeoutMs
+    result.tlsHandshakeLimit = tls.maxPendingHandshakes
   result.rand = initRand()
 
   result.workerThreads.setLen(workerThreads)
+
+  initLock(result.taskQueueLock)
+  initCond(result.taskQueueCond)
+  initLock(result.responseQueueLock)
+  initLock(result.sendQueueLock)
+  initLock(result.websocketQueuesLock)
 
   # Stuff that can fail
   try:
@@ -1543,14 +1718,9 @@ proc newServer*(
     shutdownData.event = result.shutdown
     result.selector.registerEvent(result.shutdown, shutdownData)
 
-    initLock(result.taskQueueLock)
-    initCond(result.taskQueueCond)
-    initLock(result.responseQueueLock)
-    initLock(result.sendQueueLock)
-    initLock(result.websocketQueuesLock)
-
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
+      inc result.workersStarted
   except Exception as e:
     result.destroy(true)
     raise currentExceptionAsMummyError()
