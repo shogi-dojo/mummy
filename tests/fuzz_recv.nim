@@ -6,7 +6,8 @@ include mummy
 import std/random
 randomize()
 
-const iterations = 1000
+# Windows SelectEvent uses TCP pairs; keep CI below its ephemeral-port/TIME_WAIT ceiling.
+const iterations {.intdefine: "fuzzIterations".} = 1000
 
 proc randomWhitespace(): string =
   let len = rand(0 ..< 10)

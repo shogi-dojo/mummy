@@ -1,5 +1,8 @@
 name: TLS and plain transports
-on: [push, pull_request]
+on:
+  push:
+    branches: [dojo]
+  pull_request:
 permissions:
   contents: read
 jobs:

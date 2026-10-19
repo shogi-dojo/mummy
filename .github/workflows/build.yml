@@ -1,5 +1,8 @@
 name: Github Actions
-on: [push, pull_request]
+on:
+  push:
+    branches: [dojo]
+  pull_request:
 jobs:
   build:
     strategy:
@@ -26,3 +29,6 @@ jobs:
     - run: nim c -r -d:useMalloc tests/test_http2.nim
     - run: nim c -r -d:useMalloc tests/test_websockets.nim
     - run: nim c -r -d:useMalloc -d:mummyNoWorkers tests/fuzz_recv.nim
+      if: runner.os != 'Windows'
+    - run: nim c -r -d:useMalloc -d:mummyNoWorkers -d:fuzzIterations=100 tests/fuzz_recv.nim
+      if: runner.os == 'Windows'

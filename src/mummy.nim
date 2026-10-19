@@ -1260,15 +1260,15 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
     try:
-      server.responseQueued.close()
+      if server.responseQueued != nil: server.responseQueued.close()
     except Exception as e:
       discard # Ignore
     try:
-      server.sendQueued.close()
+      if server.sendQueued != nil: server.sendQueued.close()
     except Exception as e:
       discard # Ignore
     try:
-      server.shutdown.close()
+      if server.shutdown != nil: server.shutdown.close()
     except Exception as e:
       discard # Ignore
     `=destroy`(server[])
