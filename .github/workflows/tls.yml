@@ -1,0 +1,51 @@
+name: TLS and plain transports
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  transports:
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+      - name: Install Atlas
+        run: curl -fsSL https://raw.githubusercontent.com/nim-lang/atlas/HEAD/install.sh | bash -
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          path: deps/
+          key: ${{ runner.os }}-nim-stable-atlas-${{ hashFiles('mummy.nimble') }}
+      - name: Install dependencies
+        run: atlas install -t:8 --features:testing
+      - name: OpenSSL runtime on macOS
+        if: runner.os == 'macOS'
+        run: echo "DYLD_LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+      - name: Plain unit tests
+        run: |
+          nim c -r -d:useMalloc tests/test_batching.nim
+          nim c -r tests/test_tls_state.nim
+      - name: TLS unit tests
+        run: |
+          nim c -d:useMalloc -d:ssl -d:sslVersion=3 tests/test_batching.nim
+          nim c -d:ssl -d:sslVersion=3 tests/test_tls_state.nim
+          nim c -d:ssl -d:sslVersion=3 -d:mummyTlsTest tests/test_tls_retry.nim
+          ./tests/test_batching
+          ./tests/test_tls_state
+          ./tests/test_tls_retry
+      - name: TLS and plain wire tests
+        run: |
+          nim c -d:release -d:ssl -d:sslVersion=3 -o:tests/tls_server tests/tls_server.nim
+          ruby tests/test_tls.rb tests/tls_server
